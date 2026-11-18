@@ -21,3 +21,8 @@ genes    <- as.data.frame(SummarizedExperiment::rowData(paired_se))   # gene_id,
 # DESeq2 can use it directly:
 # dds <- DESeq2::DESeqDataSet(paired_se, design = ~ patient + condition)
 ```
+
+
+```{r start}
+
+```
