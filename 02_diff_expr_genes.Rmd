@@ -1,0 +1,23 @@
+---
+title: "02 - Differentially Expressed Genes (DEGs)"
+author: "Julius Pfingsten, Simone Massinelli, Francesco Nardiello"
+date: "2026-11-18"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+
+```{r load_data}
+paired_se <- readRDS(file.path("data", "TCGA-PRAD_paired_se.rds"))
+
+counts   <- SummarizedExperiment::assay(paired_se, "counts")          # genes x samples
+metadata <- as.data.frame(SummarizedExperiment::colData(paired_se))   # one row per sample
+genes    <- as.data.frame(SummarizedExperiment::rowData(paired_se))   # gene_id, gene_name, gene_type
+
+# DESeq2 can use it directly:
+# dds <- DESeq2::DESeqDataSet(paired_se, design = ~ patient + condition)
+```
