@@ -1,0 +1,24 @@
+# Raw GDC downloads and cached data objects (large, re-creatable)
+data/GDCdata/
+GDCdata/
+data/*.rda
+data/*.rds
+MANIFEST.txt
+*.tar.gz
+/df.rds
+/results.rds
+
+# R / RStudio
+.Rhistory
+.RData
+.Rproj.user/
+*.Rproj.user
+.Ruserdata
+
+# knitr / R Markdown caches
+*_cache/
+*_files/
+
+# OS files
+.DS_Store
+Thumbs.db
