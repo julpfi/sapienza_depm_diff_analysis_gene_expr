@@ -1,0 +1,504 @@
+---
+title: "01 - GDC Data - Download, Clean, Add Metadata, and Save"
+author: "Julius Pfingsten, Simone Massinelli"
+date: "`r Sys.Date()`"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+rm(list = ls(all.names = TRUE))
+
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  fig.align = "center"
+)
+```
+
+
+
+# Setup
+
+```{r packages}
+load_or_install_packages <- function(packages) {
+  # BiocManager is needed to install Bioconductor packages
+  if (!requireNamespace("BiocManager", quietly = TRUE)) {
+    install.packages("BiocManager")
+  }
+
+  for (pck in packages) {
+    if (!require(pck, character.only = TRUE)) {
+      message("Installing: ", pck)
+      BiocManager::install(pck, update = FALSE, ask = FALSE)
+      library(pck, character.only = TRUE)
+    } else {
+      message("Package already installed; loading: ", pck)
+    }
+  }
+}
+
+load_or_install_packages(c("TCGAbiolinks", "SummarizedExperiment", "dplyr"))
+```
+
+
+```{r folders}
+project_specifier <- "TCGA-PRAD"
+
+# Folders
+root_dir <- getwd()
+data_dir <- file.path(root_dir, "data")
+target_download_dir <- file.path(data_dir, "GDCdata")
+image_dir <- file.path(root_dir, "images")
+
+# Create if non existent
+for (directory in c(data_dir, target_download_dir, image_dir)) {
+  if (!dir.exists(directory)) {
+    dir.create(directory, recursive = TRUE)
+  }
+}
+```
+
+
+
+# Get GDC Data
+
+```{r load_or_download_function}
+download_or_load_tcga_expression <- function(project, sample_type, file_label,
+                                             download_directory, save_directory,
+                                             force = FALSE) {
+
+  rda_file_path <- file.path(save_directory,
+                             paste0(project, "_", file_label, "_SummarizedExperiment.rda"))
+
+  # If cached -> load cache
+  if (file.exists(rda_file_path) && !force) {
+    message("Loading cached object: ", rda_file_path)
+    loaded_object_names <- load(rda_file_path)   # GDCprepare stores the object as `data`
+    return(get(loaded_object_names[1]))
+  }
+
+  # 1) Build the query
+  gdc_query <- TCGAbiolinks::GDCquery(
+    project       = project,
+    data.category = "Transcriptome Profiling",
+    data.type     = "Gene Expression Quantification",
+    workflow.type = "STAR - Counts",
+    sample.type   = sample_type
+  )
+
+  # 2) Download the data (files already on disk are skipped -> re-running resumes)
+  TCGAbiolinks::GDCdownload(
+    query           = gdc_query,
+    directory       = download_directory,
+    method          = "api",
+    files.per.chunk = 15
+  )
+
+  # 3) Prepare the data and save it as cache
+  TCGAbiolinks::GDCprepare(
+    query                = gdc_query,
+    directory            = download_directory,
+    summarizedExperiment = TRUE,
+    save                 = TRUE,
+    save.filename        = rda_file_path
+  )
+}
+```
+
+
+```{r get_cancer_tissue_data}
+cancerTissue_data <- download_or_load_tcga_expression(
+  project            = project_specifier,
+  sample_type        = "Primary Tumor",
+  file_label         = "cancerTissue",
+  download_directory = target_download_dir,
+  save_directory     = data_dir
+)
+
+SummarizedExperiment::assayNames(cancerTissue_data)
+
+# Raw "unstranded" counts -> TCGA did not preserve strand information
+# (= no information on which DNA strand a read came from),
+# so reads are counted regardless of strand
+cancerTissue_geneExpression_data <-
+  SummarizedExperiment::assay(cancerTissue_data, "unstranded")
+dim(cancerTissue_geneExpression_data)
+```
+
+
+```{r get_normal_tissue_data}
+normalTissue_data <- download_or_load_tcga_expression(
+  project            = project_specifier,
+  sample_type        = "Solid Tissue Normal",
+  file_label         = "normalTissue",
+  download_directory = target_download_dir,
+  save_directory     = data_dir
+)
+
+normalTissue_geneExpression_data <-
+  SummarizedExperiment::assay(normalTissue_data, "unstranded")
+dim(normalTissue_geneExpression_data)
+```
+
+
+```{r get_clinical_data}
+# Patient-level clinical data from GDC
+clinical_patient_data <- TCGAbiolinks::GDCquery_clinic(
+  project = project_specifier,
+  type    = "clinical"
+)
+
+```
+
+
+
+
+# Gene Expression Data Cleaning and Preparation
+
+## Get Gene Annotation
+
+Row names are versioned Ensembl IDs (e.g. `ENSG00000141510.18`).
+`rowData` also provides gene symbol and gene type, kept as a lookup table.
+
+```{r gene_annotation}
+gene_annotation <- as.data.frame(SummarizedExperiment::rowData(cancerTissue_data))
+gene_annotation <- gene_annotation[, intersect(c("gene_id", "gene_name", "gene_type"),
+                                               colnames(gene_annotation)), drop = FALSE]
+head(gene_annotation)
+table(gene_annotation$gene_type) %>% sort(decreasing = TRUE) %>% head(10)
+```
+
+
+
+## Common Genes
+
+Restrict tumor and normal matrices to the same set of genes.
+
+```{r identify_common_genes}
+common_gene_ids <- intersect(
+  rownames(cancerTissue_geneExpression_data),
+  rownames(normalTissue_geneExpression_data)
+)
+
+cancer_expression_common_genes <- cancerTissue_geneExpression_data[common_gene_ids,
+                                                                   , drop = FALSE]
+normal_expression_common_genes <- normalTissue_geneExpression_data[common_gene_ids,
+                                                                   , drop = FALSE]
+```
+
+
+
+## Deduplication
+
+Each TCGA barcode encodes biospecimen metadata, e.g. "TCGA-HC-7740-01A-11R-2118-07":
+
+- 1–12 = patient ID ("TCGA-HC-7740")
+  - TCGA = project
+  - HC = tissue source site (collecting hospital)
+  - 7740 = participant
+- 14–16 = sample type + vial ("01A")
+  - sample type: "01" primary tumor, "11" solid tissue normal (01–09 tumor, 10–19 normal)
+  - vial: "A", "B", … = aliquots of the same sample
+- 18–20 = portion + analyte ("11R" -> "R" = RNA)
+- 22–25 = plate ("2118") -> sequencing batch
+- 27–28 = sequencing center ("07")
+
+Some patients have several aliquots of the same tissue. These would not be independent observations.
+Thus, only one sample per patient and tissue is retained. The one to keep is selected by lowest vial first ("01A" > "01B") and then highest sequencing depth (= library size).
+
+
+```{r deduplicate_patients}
+
+deduplicate_tcga_expression_matrix <- function(expression_matrix, tissue_label,
+                                               condition_label) {
+
+  cat("\n--- Processing:", tissue_label, "---\n")
+
+  sample_metadata_table <- TCGAbiolinks::get_IDs(expression_matrix)
+
+  sample_metadata_table$barcode      <- as.character(colnames(expression_matrix))
+  sample_metadata_table$patient      <- substr(sample_metadata_table$barcode, 1, 12)
+  sample_metadata_table$sample_vial  <- substr(sample_metadata_table$barcode, 14, 16)
+  sample_metadata_table$condition    <- condition_label
+  sample_metadata_table$library_size <- colSums(expression_matrix, na.rm = TRUE)
+
+  # Inspect duplicate patients
+  duplicated_patient_ids <- unique(
+    sample_metadata_table$patient[duplicated(sample_metadata_table$patient)]
+  )
+
+  if (length(duplicated_patient_ids) > 0) {
+    cat("Found", length(duplicated_patient_ids), "patients with duplicate samples.\n")
+    duplicate_inspection_table <- sample_metadata_table %>%
+      filter(patient %in% duplicated_patient_ids) %>%
+      arrange(patient, sample_vial, desc(library_size))
+    print(duplicate_inspection_table[, c("patient", "barcode", "sample_vial",
+                                         "portion", "plate", "library_size")])
+  } else {
+    cat("No duplicate patients found in", tissue_label, "\n")
+  }
+
+  # Sort by patient, lowest vial, highest library size, and keep the first occurrence
+  deduplicated_metadata_table <- sample_metadata_table %>%
+    arrange(patient, sample_vial, desc(library_size)) %>%
+    filter(!duplicated(patient))
+
+  deduplicated_expression_matrix <-
+    expression_matrix[, deduplicated_metadata_table$barcode, drop = FALSE]
+
+  cat("Samples before:", ncol(expression_matrix),
+      "| after deduplication:", ncol(deduplicated_expression_matrix), "\n")
+
+  list(
+    clean_expression_matrix = deduplicated_expression_matrix,
+    clean_sample_metadata   = deduplicated_metadata_table
+  )
+}
+
+
+
+# Deduplicate each tissue
+cancer_deduplicated_tcga_expression <- deduplicate_tcga_expression_matrix(
+  expression_matrix = cancer_expression_common_genes,
+  tissue_label      = "Cancer Tissue",
+  condition_label   = "cancer"
+)
+
+normal_deduplicated_tcga_expression <- deduplicate_tcga_expression_matrix(
+  expression_matrix = normal_expression_common_genes,
+  tissue_label      = "Normal Tissue",
+  condition_label   = "normal"
+)
+```
+
+
+
+## Matched (Paired) Patients
+
+We keep only patients with both a tumor and a normal sample. Each patient serves as their own control (paired design).
+
+Normal samples are the limiting factor. All 52 normal patients also have a tumor sample -> 52 matched pairs.
+
+```{r match_filter_pairs}
+cancer_sample_metadata <- cancer_deduplicated_tcga_expression$clean_sample_metadata
+normal_sample_metadata <- normal_deduplicated_tcga_expression$clean_sample_metadata
+
+common_patient_barcodes <- intersect(cancer_sample_metadata$patient,
+                                     normal_sample_metadata$patient)
+
+cat("Unique tumor patients :", nrow(cancer_sample_metadata), "\n")
+cat("Unique normal patients:", nrow(normal_sample_metadata), "\n")
+cat("Matched patients      :", length(common_patient_barcodes), "\n")
+
+cancer_paired_metadata <- cancer_sample_metadata %>%
+  filter(patient %in% common_patient_barcodes)
+normal_paired_metadata <- normal_sample_metadata %>%
+  filter(patient %in% common_patient_barcodes)
+
+cancerTissue_geneExpression_cleanMatrix <-
+  cancer_deduplicated_tcga_expression$clean_expression_matrix[
+    , cancer_paired_metadata$barcode, drop = FALSE]
+normalTissue_geneExpression_cleanMatrix <-
+  normal_deduplicated_tcga_expression$clean_expression_matrix[
+    , normal_paired_metadata$barcode, drop = FALSE]
+```
+
+
+
+## Patient Metadata Reference
+
+The count matrix holds one column per sample (tissue specimen) with ~60,000 genes. The metadata table describes each sample (one row per sample) and is used later in the analysis.
+
+Two sources are merged on the patient ID ("patient" = "submitter_id"):
+
+- Technical metadata (from the barcode, per sample) = how the sample was processed
+  - condition: "cancer" / "normal" (from sample type)
+  - plate -> sequencing batch
+  - vial, portion, library size
+- Clinical metadata (from GDC clinical table, per patient) = who the patient is
+  - age_at_index -> age at diagnosis
+  - sex_at_birth
+
+Confounders: age, plate, patient. They influence expression besides the condition. Including them in the model avoids spurious associations and increases statistical power.
+Sex is excluded as PRAD is a prostate cancer cohort so every patient is male giving sex as constant.
+
+Samples with missing confounder values are removed together with their pair.
+
+
+```{r create_metadata_reference}
+# Merge technical metadata (per sample) with clinical metadata (per patient)
+# many-to-one: stops if a patient has several clinical rows
+build_sample_metadata <- function(technical_metadata, clinical_metadata) {
+  technical_metadata %>%
+    left_join(clinical_metadata, by = "patient", relationship = "many-to-one") %>%
+    select(-any_of("myorder")) %>%
+    tibble::column_to_rownames("barcode")
+}
+
+# Missing values per study variable
+print_missing_value_summary <- function(sample_metadata) {
+  is_na <- is.na(sample_metadata[, required_study_columns])
+  data.frame(missing = colSums(is_na), percent = round(100 * colMeans(is_na), 1))
+}
+
+
+# Declared confounders
+target_confounder_columns <- c("age_at_index", "sex_at_birth", "plate", "patient")
+
+
+# Clinical data (per patient)
+# recent GDC releases use "sex_at_birth" while older ones were "gender"
+sex_column_name <- intersect(c("sex_at_birth", "gender"), colnames(clinical_patient_data))[1]
+
+selected_clinical_metadata <- clinical_patient_data %>%
+  select(patient = submitter_id, age_at_index, sex_at_birth = all_of(sex_column_name)) %>%
+  mutate(across(where(is.character),
+                ~ replace(., tolower(trimws(.)) %in% c("not reported", "unknown", ""), NA)))
+
+
+# Whole metadata = technical + clinical
+paired_patient_metadata <- build_sample_metadata(
+  bind_rows(cancer_paired_metadata, normal_paired_metadata),
+  selected_clinical_metadata
+)
+
+
+# Drop constant confounders (e.g. sex in PRAD: all male)
+is_constant <- sapply(target_confounder_columns, function(col)
+  n_distinct(paired_patient_metadata[[col]], na.rm = TRUE) < 2)
+cat("Dropped constant confounders:", target_confounder_columns[is_constant], "\n")
+
+target_confounder_columns <- target_confounder_columns[!is_constant]
+required_study_columns    <- c(target_confounder_columns, "condition")
+
+
+# Missing values -> drop the whole pair if one sample is incomplete
+print_missing_value_summary(paired_patient_metadata)
+
+incomplete <- !complete.cases(paired_patient_metadata[, required_study_columns])
+patients_to_remove <- unique(paired_patient_metadata$patient[incomplete])
+paired_patient_metadata <-
+  paired_patient_metadata[!paired_patient_metadata$patient %in% patients_to_remove, ]
+
+cat("Removed patients (missing data):", length(patients_to_remove), "\n")
+cat("Paired samples:", nrow(paired_patient_metadata),
+    "| patients:", n_distinct(paired_patient_metadata$patient), "\n")
+```
+
+
+## Format Variables
+
+```{r format_variables}
+format_sample_metadata <- function(sample_metadata) {
+  sample_metadata$condition    <- factor(sample_metadata$condition,
+                                         levels = c("normal", "cancer"))  # normal = reference
+  sample_metadata$sex_at_birth <- factor(sample_metadata$sex_at_birth)
+  sample_metadata$plate        <- factor(sample_metadata$plate)
+  sample_metadata$patient      <- factor(sample_metadata$patient)
+  # Center and scale age (mean = 0, SD = 1) for numerical stability in GLMs
+  sample_metadata$scaled_age   <- as.numeric(scale(sample_metadata$age_at_index))
+  sample_metadata
+}
+
+paired_patient_metadata <- format_sample_metadata(paired_patient_metadata)
+
+# Sex: documented, but only used as confounder if not constant (see above)
+table(paired_patient_metadata$sex_at_birth, useNA = "ifany")
+
+# Plate vs condition: a plate that contains only one condition is confounded with it
+table(paired_patient_metadata$plate, paired_patient_metadata$condition)
+summary(paired_patient_metadata$age_at_index)
+```
+
+
+
+## Align Count Matrix and Metadata
+
+The count matrix columns must be in exactly the same order as the metadata rows.
+
+```{r align}
+combined_expression_matrix <- cbind(
+  cancerTissue_geneExpression_cleanMatrix,
+  normalTissue_geneExpression_cleanMatrix
+)
+
+valid_sample_barcodes      <- rownames(paired_patient_metadata)
+paired_counts_matrix       <- combined_expression_matrix[, valid_sample_barcodes, drop = FALSE]
+paired_patient_metadata    <- paired_patient_metadata[valid_sample_barcodes, , drop = FALSE]
+
+stopifnot(identical(colnames(paired_counts_matrix), rownames(paired_patient_metadata)))
+
+dim(paired_counts_matrix)
+table(paired_patient_metadata$condition)
+```
+
+
+## Full Tumor Cohort Metadata
+
+For tumor-only analyses we also build the metadata for all deduplicated tumor samples (paired or not).
+
+```{r tumor_metadata}
+tumor_patient_metadata <- build_sample_metadata(
+  technical_metadata = cancer_sample_metadata,
+  clinical_metadata  = selected_clinical_metadata
+)
+tumor_patient_metadata <- format_sample_metadata(tumor_patient_metadata)
+
+tumor_counts_matrix <- cancer_deduplicated_tcga_expression$clean_expression_matrix[
+  , rownames(tumor_patient_metadata), drop = FALSE]
+
+stopifnot(identical(colnames(tumor_counts_matrix), rownames(tumor_patient_metadata)))
+
+cat("Tumor samples (all patients):", ncol(tumor_counts_matrix), "\n")
+print_missing_value_summary(tumor_patient_metadata)
+```
+
+
+## Save Data
+
+Saved as `SummarizedExperiment` (.rds): counts, sample metadata and gene annotation
+in one object, with sample alignment checked on creation.
+
+- paired cohort: 52 tumor-normal pairs (104 samples)
+- tumor cohort: all 497 deduplicated tumor samples
+- full GDC clinical table
+
+```{r save_prepared_data}
+paired_se <- SummarizedExperiment::SummarizedExperiment(
+  assays  = list(counts = paired_counts_matrix),
+  colData = paired_patient_metadata,
+  rowData = gene_annotation[rownames(paired_counts_matrix), , drop = FALSE]
+)
+
+tumor_se <- SummarizedExperiment::SummarizedExperiment(
+  assays  = list(counts = tumor_counts_matrix),
+  colData = tumor_patient_metadata,
+  rowData = gene_annotation[rownames(tumor_counts_matrix), , drop = FALSE]
+)
+
+saveRDS(paired_se, file.path(data_dir, paste0(project_specifier, "_paired_se.rds")))
+saveRDS(tumor_se,  file.path(data_dir, paste0(project_specifier, "_tumor_se.rds")))
+saveRDS(clinical_patient_data,
+        file.path(data_dir, paste0(project_specifier, "_clinical.rds")))
+
+
+# Optional CSV export (e.g. for Python / Excel)
+export_csv <- FALSE
+if (export_csv) {
+  write.csv(paired_patient_metadata,
+            file.path(data_dir, paste0(project_specifier, "_paired_metadata.csv")))
+  write.csv(paired_counts_matrix,
+            gzfile(file.path(data_dir, paste0(project_specifier, "_paired_counts.csv.gz"))))
+  write.csv(tumor_patient_metadata,
+            file.path(data_dir, paste0(project_specifier, "_tumor_metadata.csv")))
+  write.csv(tumor_counts_matrix,
+            gzfile(file.path(data_dir, paste0(project_specifier, "_tumor_counts.csv.gz"))))
+}
+```
+
+## Session Info
+
+```{r session_info}
+sessionInfo()
+```
