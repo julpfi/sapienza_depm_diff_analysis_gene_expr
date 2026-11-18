@@ -453,3 +453,52 @@ stopifnot(identical(colnames(tumor_counts_matrix), rownames(tumor_patient_metada
 cat("Tumor samples (all patients):", ncol(tumor_counts_matrix), "\n")
 print_missing_value_summary(tumor_patient_metadata)
 ```
+
+
+## Save Data
+
+Saved as `SummarizedExperiment` (.rds): counts, sample metadata and gene annotation
+in one object, with sample alignment checked on creation.
+
+- paired cohort: 52 tumor-normal pairs (104 samples)
+- tumor cohort: all 497 deduplicated tumor samples
+- full GDC clinical table
+
+```{r save_prepared_data}
+paired_se <- SummarizedExperiment::SummarizedExperiment(
+  assays  = list(counts = paired_counts_matrix),
+  colData = paired_patient_metadata,
+  rowData = gene_annotation[rownames(paired_counts_matrix), , drop = FALSE]
+)
+
+tumor_se <- SummarizedExperiment::SummarizedExperiment(
+  assays  = list(counts = tumor_counts_matrix),
+  colData = tumor_patient_metadata,
+  rowData = gene_annotation[rownames(tumor_counts_matrix), , drop = FALSE]
+)
+
+saveRDS(paired_se, file.path(data_dir, paste0(project_specifier, "_paired_se.rds")))
+saveRDS(tumor_se,  file.path(data_dir, paste0(project_specifier, "_tumor_se.rds")))
+saveRDS(clinical_patient_data,
+        file.path(data_dir, paste0(project_specifier, "_clinical.rds")))
+
+
+# Optional CSV export (e.g. for Python / Excel)
+export_csv <- FALSE
+if (export_csv) {
+  write.csv(paired_patient_metadata,
+            file.path(data_dir, paste0(project_specifier, "_paired_metadata.csv")))
+  write.csv(paired_counts_matrix,
+            gzfile(file.path(data_dir, paste0(project_specifier, "_paired_counts.csv.gz"))))
+  write.csv(tumor_patient_metadata,
+            file.path(data_dir, paste0(project_specifier, "_tumor_metadata.csv")))
+  write.csv(tumor_counts_matrix,
+            gzfile(file.path(data_dir, paste0(project_specifier, "_tumor_counts.csv.gz"))))
+}
+```
+
+## Session Info
+
+```{r session_info}
+sessionInfo()
+```
