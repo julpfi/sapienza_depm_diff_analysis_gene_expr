@@ -9,7 +9,10 @@ output: html_document
 knitr::opts_chunk$set(echo = TRUE)
 ```
 
-
+```{r libraries}
+library(ggplot2)
+library(DESeq2)
+```
 
 ```{r load_data}
 paired_se <- readRDS(file.path("data", "TCGA-PRAD_paired_se.rds"))
@@ -17,12 +20,95 @@ paired_se <- readRDS(file.path("data", "TCGA-PRAD_paired_se.rds"))
 counts   <- SummarizedExperiment::assay(paired_se, "counts")          # genes x samples
 metadata <- as.data.frame(SummarizedExperiment::colData(paired_se))   # one row per sample
 genes    <- as.data.frame(SummarizedExperiment::rowData(paired_se))   # gene_id, gene_name, gene_type
-
-# DESeq2 can use it directly:
-# dds <- DESeq2::DESeqDataSet(paired_se, design = ~ patient + condition)
 ```
 
 
-```{r start}
+```{r Low expression genes removal, warning=FALSE}
 
+# create the DESeqDataSet filtering out lowly expressed genes
+dds <- DESeqDataSet(paired_se, design = ~ patient + condition)
+keep <- rowSums(counts(dds) >= 10) >= 10
+dds <- dds[keep, ]
+length(dds)
 ```
+
+
+```{r p-value and Fold Change}
+# compute Fold Change and p-values for all remaining genes
+dds <- DESeq(dds)
+res_df <- as.data.frame(results(dds, contrast = c("condition", "cancer", "normal")))
+
+# inspect the output
+head(res_df[, c("log2FoldChange", "pvalue", "padj")])
+```
+
+```{r Visualization of Number of DG with p-value and FC changing}
+
+# convert grid matrix to long format
+df_grid <- expand.grid(
+  padj = padj_grid,
+  log2FC = fc_grid
+)
+df_grid$DEGs <- as.vector(z_mat)
+
+# plot heatmap with exact DEG counts
+ggplot(df_grid, aes(x = factor(round(log2FC, 2)), y = factor(padj), fill = DEGs)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = DEGs), color = "white", size = 3.5, fontface = "bold") +
+  scale_fill_viridis_c() +
+  labs(
+    title = "Number of DEGs by Thresholds",
+    x = "|log2FoldChange| threshold",
+    y = "padj threshold",
+    fill = "DEGs"
+  ) +
+  theme_minimal()
+```
+
+```{r Volcano plot}
+
+# set final thresholds
+padj_thresh <- 0.01
+lfc_thresh  <- 2
+
+# remove NAs and classify each gene
+volcano_df <- res_df[!is.na(res_df$padj) & !is.na(res_df$log2FoldChange), ]
+volcano_df$status <- "Not Significant"
+volcano_df$status[volcano_df$padj <= padj_thresh & volcano_df$log2FoldChange >= lfc_thresh]  <- "Up-regulated"
+volcano_df$status[volcano_df$padj <= padj_thresh & volcano_df$log2FoldChange <= -lfc_thresh] <- "Down-regulated"
+
+# extract final DEGs table and gene IDs for Task 3
+degs_df  <- volcano_df[volcano_df$status != "Not Significant", ]
+deg_ids  <- rownames(degs_df)
+
+# print summary counts
+table(volcano_df$status)
+
+# handle potential padj == 0 values to avoid Inf on the y-axis
+min_nonzero_padj <- min(volcano_df$padj[volcano_df$padj > 0])
+volcano_df$neg_log10_padj <- -log10(pmax(volcano_df$padj, min_nonzero_padj))
+
+# generate Volcano plot
+ggplot(volcano_df, aes(x = log2FoldChange, y = neg_log10_padj, color = status)) +
+  geom_point(alpha = 0.6, size = 1.2) +
+  scale_color_manual(values = c(
+    "Down-regulated"  = "steelblue",
+    "Not Significant" = "grey70",
+    "Up-regulated"    = "firebrick"
+  )) +
+  geom_vline(xintercept = c(-lfc_thresh, lfc_thresh), linetype = "dashed", color = "black") +
+  geom_hline(yintercept = -log10(padj_thresh), linetype = "dashed", color = "black") +
+  labs(
+    title = "Volcano Plot (Cancer vs Normal)",
+    subtitle = paste0("Thresholds: padj <= ", padj_thresh, ", |log2FC| >= ", lfc_thresh, " (", nrow(degs_df), " DEGs)"),
+    x = "log2(Fold Change)",
+    y = "-log10(adjusted p-value)",
+    color = "Regulation"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "top")
+```
+
+
+
+
