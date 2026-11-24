@@ -1,57 +1,104 @@
 ---
 title: "02 - Differentially Expressed Genes (DEGs)"
 author: "Julius Pfingsten, Simone Massinelli, Francesco Nardiello"
-date: "2026-11-18"
+date: "`r Sys.Date()`"
 output: html_document
 ---
 
 ```{r setup, include=FALSE}
-knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  fig.align = "center"
+)
 ```
 
-```{r libraries}
-library(ggplot2)
-library(DESeq2)
+
+# Setup
+
+- `config.R`: project settings, paths, parameters, colors, ggplot theme
+- Packages are installed in `01_data_preparation.Rmd`; here they are only checked and loaded
+
+```{r config}
+source("config.R")
+check_and_load_packages(required_packages)
+set.seed(random_seed)
 ```
+
+
+# Load Data
+
+Paired cohort from `01_data_preparation.Rmd`: raw counts, sample metadata, gene annotation.
 
 ```{r load_data}
-paired_se <- readRDS(file.path("data", "TCGA-PRAD_paired_se.rds"))
+paired_se <- readRDS(data_path("paired_se.rds"))
 
-counts   <- SummarizedExperiment::assay(paired_se, "counts")          # genes x samples
-metadata <- as.data.frame(SummarizedExperiment::colData(paired_se))   # one row per sample
-genes    <- as.data.frame(SummarizedExperiment::rowData(paired_se))   # gene_id, gene_name, gene_type
+genes <- as.data.frame(rowData(paired_se))   # gene_id, gene_name, gene_type
+
+dim(paired_se)
+table(paired_se$condition)
 ```
 
 
-```{r Low expression genes removal, warning=FALSE}
+# DESeq2 Pipeline
 
-# create the DESeqDataSet filtering out lowly expressed genes
+- Input: **raw counts** (Negative Binomial model needs counts)
+- Paired design `~ patient + condition`: each patient is their own control; age and plate are constant within a patient and therefore absorbed
+- Reference level: `normal` -> fold changes are cancer vs normal
+
+## Low Expression Filter
+
+- Genes with very few reads are mostly noise -> unstable estimates, more multiple testing
+- Keep genes with >= 10 reads in >= 10 samples
+
+```{r filter_low_expression}
 dds <- DESeqDataSet(paired_se, design = ~ patient + condition)
+
 keep <- rowSums(counts(dds) >= 10) >= 10
-dds <- dds[keep, ]
-length(dds)
+dds  <- dds[keep, ]
+
+cat("Genes before filter:", length(keep), "| after filter:", nrow(dds), "\n")
 ```
 
+## Normalization, Dispersion and Test
 
-```{r p-value and Fold Change}
-# compute Fold Change and p-values for all remaining genes
+`DESeq()` runs three steps:
+
+1. `estimateSizeFactors()` -> normalization (median-of-ratios), one size factor per sample
+2. `estimateDispersions()` -> gene-wise variability (mean-variance relationship)
+3. `nbinomWaldTest()` -> Negative Binomial GLM per gene, Wald test on `condition`
+
+P-values are corrected for multiple testing with Benjamini-Hochberg (FDR) -> `padj`.
+
+```{r deseq}
 dds <- DESeq(dds)
+
 res_df <- as.data.frame(results(dds, contrast = c("condition", "cancer", "normal")))
 
-# inspect the output
+summary(sizeFactors(dds))
 head(res_df[, c("log2FoldChange", "pvalue", "padj")])
 ```
 
-```{r Visualization of Number of DG with p-value and FC changing}
 
-# convert grid matrix to long format
-df_grid <- expand.grid(
-  padj = padj_grid,
-  log2FC = fc_grid
-)
+# Threshold Selection
+
+- Task: padj <= 0.05 and |FC| >= 1.2 (i.e. |log2FC| >= 0.263) -> "hundreds of genes"
+- Number of DEGs for a grid of thresholds -> choose thresholds giving hundreds of genes
+
+```{r threshold_grid}
+padj_grid <- c(0.05, 0.01, 0.001)
+fc_grid   <- log2(c(1.2, 1.5, 2, 3, 4))   # fold change -> log2 scale
+
+# rows = padj thresholds, columns = log2FC thresholds
+z_mat <- sapply(fc_grid, function(fc)
+  sapply(padj_grid, function(p)
+    sum(res_df$padj <= p & abs(res_df$log2FoldChange) >= fc, na.rm = TRUE)))
+
+# long format: padj varies fastest, matching the column-wise order of z_mat
+df_grid <- expand.grid(padj = padj_grid, log2FC = fc_grid)
 df_grid$DEGs <- as.vector(z_mat)
 
-# plot heatmap with exact DEG counts
 ggplot(df_grid, aes(x = factor(round(log2FC, 2)), y = factor(padj), fill = DEGs)) +
   geom_tile(color = "white") +
   geom_text(aes(label = DEGs), color = "white", size = 3.5, fontface = "bold") +
@@ -61,54 +108,97 @@ ggplot(df_grid, aes(x = factor(round(log2FC, 2)), y = factor(padj), fill = DEGs)
     x = "|log2FoldChange| threshold",
     y = "padj threshold",
     fill = "DEGs"
-  ) +
-  theme_minimal()
+  )
 ```
 
-```{r Volcano plot}
 
-# set final thresholds
-padj_thresh <- 0.01
-lfc_thresh  <- 2
+# DEGs and Volcano Plot
 
-# remove NAs and classify each gene
+Final padj <= `r padj_thresh` and |log2FC| >= `r lfc_thresh`
+
+```{r classify_degs}
+cat("padj <=", padj_thresh, "| |log2FC| >=", lfc_thresh, "\n")
+
+# remove NAs (genes excluded by DESeq2's outlier / independent filtering) and classify
 volcano_df <- res_df[!is.na(res_df$padj) & !is.na(res_df$log2FoldChange), ]
 volcano_df$status <- "Not Significant"
-volcano_df$status[volcano_df$padj <= padj_thresh & volcano_df$log2FoldChange >= lfc_thresh]  <- "Up-regulated"
-volcano_df$status[volcano_df$padj <= padj_thresh & volcano_df$log2FoldChange <= -lfc_thresh] <- "Down-regulated"
+volcano_df$status[volcano_df$padj <= padj_thresh &
+                    volcano_df$log2FoldChange >= lfc_thresh]  <- "Up-regulated"
+volcano_df$status[volcano_df$padj <= padj_thresh &
+                    volcano_df$log2FoldChange <= -lfc_thresh] <- "Down-regulated"
 
-# extract final DEGs table and gene IDs for Task 3
-degs_df  <- volcano_df[volcano_df$status != "Not Significant", ]
-deg_ids  <- rownames(degs_df)
+degs_df <- volcano_df[volcano_df$status != "Not Significant", ]
+deg_ids <- rownames(degs_df)
 
-# print summary counts
 table(volcano_df$status)
+```
 
-# handle potential padj == 0 values to avoid Inf on the y-axis
+```{r volcano_plot, fig.width=7, fig.height=6}
+# padj == 0 would give Inf on the y-axis -> replace by smallest non-zero value
 min_nonzero_padj <- min(volcano_df$padj[volcano_df$padj > 0])
 volcano_df$neg_log10_padj <- -log10(pmax(volcano_df$padj, min_nonzero_padj))
 
-# generate Volcano plot
-ggplot(volcano_df, aes(x = log2FoldChange, y = neg_log10_padj, color = status)) +
+p_volcano <- ggplot(volcano_df, aes(x = log2FoldChange, y = neg_log10_padj, color = status)) +
   geom_point(alpha = 0.6, size = 1.2) +
-  scale_color_manual(values = c(
-    "Down-regulated"  = "steelblue",
-    "Not Significant" = "grey70",
-    "Up-regulated"    = "firebrick"
-  )) +
+  scale_color_manual(values = regulation_colors) +
   geom_vline(xintercept = c(-lfc_thresh, lfc_thresh), linetype = "dashed", color = "black") +
   geom_hline(yintercept = -log10(padj_thresh), linetype = "dashed", color = "black") +
   labs(
     title = "Volcano Plot (Cancer vs Normal)",
-    subtitle = paste0("Thresholds: padj <= ", padj_thresh, ", |log2FC| >= ", lfc_thresh, " (", nrow(degs_df), " DEGs)"),
+    subtitle = paste0("Thresholds: padj <= ", padj_thresh, ", |log2FC| >= ", lfc_thresh,
+                      " (", nrow(degs_df), " DEGs)"),
     x = "log2(Fold Change)",
     y = "-log10(adjusted p-value)",
     color = "Regulation"
-  ) +
-  theme_minimal() +
-  theme(legend.position = "top")
+  )
+
+p_volcano
+save_plot(p_volcano, "task2_volcano_plot", width = 7, height = 6)
 ```
 
 
+# Variance-stabilized Data for Tasks 3-5
 
+- Correlations and distances need normalized **and** variance-stabilized values
+- VST: same filter and size factors as the DEA; flattens the mean-variance relationship
+- `blind = FALSE`: uses the design, so the real tumor/normal differences are not treated as noise
+
+```{r vst}
+vsd      <- vst(dds, blind = FALSE)
+vst_expr <- assay(vsd)   # filtered genes x 104 samples, log2-like scale
+
+dim(vst_expr)
+```
+
+```{r mean_sd_vst, fig.width=6, fig.height=4}
+# Check: spread should be roughly constant along the mean (flat trend line)
+gene_mean <- rowMeans(vst_expr)
+gene_sd   <- apply(vst_expr, 1, sd)
+
+plot(rank(gene_mean), gene_sd, pch = 16, cex = 0.3,
+     col = adjustcolor(color_palette[["primary"]], alpha.f = 0.2),
+     xlab = "Rank of gene mean expression (low to high)",
+     ylab = "Standard deviation across samples",
+     main = "VST: mean-SD relationship")
+lines(lowess(rank(gene_mean), gene_sd), col = color_palette[["accent"]], lwd = 3)
+```
+
+
+# Save Results
+
+- DEG table -> `results/` (small, part of the results)
+- VST matrix -> `data/` (input for Tasks 3-5)
+
+```{r save_results}
+degs_out <- data.frame(
+  gene_id        = deg_ids,
+  gene_name      = genes[deg_ids, "gene_name"],
+  log2FoldChange = degs_df$log2FoldChange,
+  padj           = degs_df$padj,
+  status         = degs_df$status
+)
+
+write.csv(degs_out, results_path("degs.csv"), row.names = FALSE)
+saveRDS(vst_expr, data_path("vst.rds"))
+```
 
