@@ -51,8 +51,8 @@ lfc_thresh <- log2(4) #or log2(3)   # |log2 fold change|
 
 
 # Task 3: co-expression networks
-cor_method    <- "pearson"   # "pearson" or "spearman"
-cor_threshold <- 0.7         # hard threshold on |rho|
+cor_method <- "spearman"     # "pearson" or "spearman"
+cor_threshold <- 0.5         # hard threshold on |rho|
 hub_fraction  <- 0.05        # hubs = top 5% of nodes by degree
 
 
@@ -80,6 +80,15 @@ regulation_colors <- c(
   "Up-regulated"    = "firebrick",
   "Down-regulated"  = "steelblue",
   "Not Significant" = "grey"
+)
+
+
+# Edge Link Correlations (Task 3)
+edge_colors <- c(
+  "both"          = "steelblue",
+  "Pearson only"  = "orange",
+  "Spearman only" = "#009E73",
+  "no edge"       = "grey85"
 )
 
 
