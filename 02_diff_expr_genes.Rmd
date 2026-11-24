@@ -99,7 +99,7 @@ z_mat <- sapply(fc_grid, function(fc)
 df_grid <- expand.grid(padj = padj_grid, log2FC = fc_grid)
 df_grid$DEGs <- as.vector(z_mat)
 
-ggplot(df_grid, aes(x = factor(round(log2FC, 2)), y = factor(padj), fill = DEGs)) +
+p_grid_padj_log2FC <- ggplot(df_grid, aes(x = factor(round(log2FC, 2)), y = factor(padj), fill = DEGs)) +
   geom_tile(color = "white") +
   geom_text(aes(label = DEGs), color = "white", size = 3.5, fontface = "bold") +
   scale_fill_viridis_c() +
@@ -109,18 +109,24 @@ ggplot(df_grid, aes(x = factor(round(log2FC, 2)), y = factor(padj), fill = DEGs)
     y = "padj threshold",
     fill = "DEGs"
   )
+
+
+p_grid_padj_log2FC
+save_plot(p_grid_padj_log2FC, "task2_grid_padj_log2FC", width = 7, height = 5)
+```
+
+```{r selected_padj_thresh_lfc_thresh}
+cat("padj <=", padj_thresh, "| |log2FC| >=", lfc_thresh, "\n")
+#Final padj <= `r padj_thresh` and |log2FC| >= `r lfc_thresh` 
 ```
 
 
 # DEGs and Volcano Plot
 
-Final padj <= `r padj_thresh` and |log2FC| >= `r lfc_thresh`
-
 ```{r classify_degs}
-cat("padj <=", padj_thresh, "| |log2FC| >=", lfc_thresh, "\n")
-
 # remove NAs (genes excluded by DESeq2's outlier / independent filtering) and classify
 volcano_df <- res_df[!is.na(res_df$padj) & !is.na(res_df$log2FoldChange), ]
+
 volcano_df$status <- "Not Significant"
 volcano_df$status[volcano_df$padj <= padj_thresh &
                     volcano_df$log2FoldChange >= lfc_thresh]  <- "Up-regulated"
@@ -153,7 +159,8 @@ p_volcano <- ggplot(volcano_df, aes(x = log2FoldChange, y = neg_log10_padj, colo
   )
 
 p_volcano
-save_plot(p_volcano, "task2_volcano_plot", width = 7, height = 6)
+
+save_plot(p_volcano, paste0("task2_volcano_plot_log2FC_", lfc_thresh), width = 7, height = 6)
 ```
 
 
@@ -177,20 +184,19 @@ p_ma <- ggplot(volcano_df, aes(x = baseMean, y = log2FoldChange, color = status)
        color = "Regulation")
 
 p_ma
-save_plot(p_ma, "task2_ma_plot", width = 7, height = 5)
+save_plot(p_ma, paste0("task2_ma_plot_log2FC_", lfc_thresh), width = 7, height = 5)
 ```
 
 
 
 
-# Variance-stabilized Data for Tasks 3-5
+# Variance-stabilized Data for Follwing Tasks
 
-- Correlations and distances need normalized **and** variance-stabilized values
-- VST: same filter and size factors as the DEA; flattens the mean-variance relationship
-- `blind = FALSE`: uses the design, so the real tumor/normal differences are not treated as noise
+- Correlations and distances need normalized and variance-stabilized values
+- VST: same filter and size factors as the DEA -> flattens the mean-variance relationship
 
 ```{r vst}
-vsd      <- vst(dds, blind = FALSE)
+vsd <- vst(dds, blind = FALSE)  #blind=FALSE - uses the design -> real tumor/normal differences are not treated as noise
 vst_expr <- assay(vsd)   # filtered genes x 104 samples, log2-like scale
 
 dim(vst_expr)
@@ -206,7 +212,7 @@ plot(rank(gene_mean), gene_sd, pch = 16, cex = 0.3,
      xlab = "Rank of gene mean expression (low to high)",
      ylab = "Standard deviation across samples",
      main = "VST: mean-SD relationship")
-lines(lowess(rank(gene_mean), gene_sd), col = color_palette[["accent"]], lwd = 3)
+lines(lowess(rank(gene_mean), gene_sd), col = color_palette[["tertiary"]], lwd = 3)
 ```
 
 
@@ -218,11 +224,11 @@ lines(lowess(rank(gene_mean), gene_sd), col = color_palette[["accent"]], lwd = 3
 
 ```{r save_results}
 degs_out <- data.frame(
-  gene_id        = deg_ids,
-  gene_name      = genes[deg_ids, "gene_name"],
+  gene_id = deg_ids,
+  gene_name = genes[deg_ids, "gene_name"],
   log2FoldChange = degs_df$log2FoldChange,
-  padj           = degs_df$padj,
-  status         = degs_df$status
+  padj = degs_df$padj,
+  status = degs_df$status
 )
 
 write.csv(degs_out, results_path("degs.csv"), row.names = FALSE)
