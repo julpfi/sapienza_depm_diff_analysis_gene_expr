@@ -2,7 +2,7 @@
 title: "01 - GDC Data - Download, Clean, Add Metadata, and Save"
 author: "Julius Pfingsten, Simone Massinelli"
 date: "`r Sys.Date()`"
-output: pdf_document
+output: html_document
 ---
 
 ```{r setup, include=FALSE}
@@ -19,6 +19,16 @@ knitr::opts_chunk$set(
 
 
 # Setup
+
+- `config.R`: project settings, paths, parameters, colors, ggplot theme (shared by all notebooks)
+- All packages of the project are installed here (later notebooks only load them)
+
+
+```{r config}
+source("config.R")
+set.seed(random_seed)
+```
+
 
 ```{r packages}
 load_or_install_packages <- function(packages) {
@@ -38,21 +48,16 @@ load_or_install_packages <- function(packages) {
   }
 }
 
-load_or_install_packages(c("TCGAbiolinks", "SummarizedExperiment", "dplyr"))
+load_or_install_packages(required_packages)
+
+# Packages are installed now -> apply the project ggplot theme
+ggplot2::theme_set(theme_project())
 ```
 
 
 ```{r folders}
-project_specifier <- "TCGA-PRAD"
-
-# Folders
-root_dir <- getwd()
-data_dir <- file.path(root_dir, "data")
-target_download_dir <- file.path(data_dir, "GDCdata")
-image_dir <- file.path(root_dir, "images")
-
-# Create if non existent
-for (directory in c(data_dir, target_download_dir, image_dir)) {
+# Paths are defined in config.R -> Create folders if non existent
+for (directory in c(data_dir, target_download_dir, results_dir, image_dir)) {
   if (!dir.exists(directory)) {
     dir.create(directory, recursive = TRUE)
   }
@@ -148,7 +153,6 @@ clinical_patient_data <- TCGAbiolinks::GDCquery_clinic(
   project = project_specifier,
   type    = "clinical"
 )
-
 ```
 
 
@@ -321,7 +325,7 @@ Two sources are merged on the patient ID ("patient" = "submitter_id"):
   - sex_at_birth
 
 Confounders: age, plate, patient. They influence expression besides the condition. Including them in the model avoids spurious associations and increases statistical power.
-Sex is excluded as PRAD is a prostate cancer cohort so every patient is male giving sex as constant.
+Sex is excluded: PRAD is a prostate cancer cohort, so all patients are male and sex is constant.
 
 Samples with missing confounder values are removed together with their pair.
 
@@ -477,28 +481,19 @@ tumor_se <- SummarizedExperiment::SummarizedExperiment(
   rowData = gene_annotation[rownames(tumor_counts_matrix), , drop = FALSE]
 )
 
-saveRDS(paired_se, file.path(data_dir, paste0(project_specifier, "_paired_se.rds")))
-saveRDS(tumor_se,  file.path(data_dir, paste0(project_specifier, "_tumor_se.rds")))
-saveRDS(clinical_patient_data,
-        file.path(data_dir, paste0(project_specifier, "_clinical.rds")))
+saveRDS(paired_se, data_path("paired_se.rds"))
+saveRDS(tumor_se, data_path("tumor_se.rds"))
+saveRDS(clinical_patient_data, data_path("clinical.rds"))
 
 
 # Optional CSV export (e.g. for Python / Excel)
 export_csv <- FALSE
 if (export_csv) {
-  write.csv(paired_patient_metadata,
-            file.path(data_dir, paste0(project_specifier, "_paired_metadata.csv")))
-  write.csv(paired_counts_matrix,
-            gzfile(file.path(data_dir, paste0(project_specifier, "_paired_counts.csv.gz"))))
-  write.csv(tumor_patient_metadata,
-            file.path(data_dir, paste0(project_specifier, "_tumor_metadata.csv")))
-  write.csv(tumor_counts_matrix,
-            gzfile(file.path(data_dir, paste0(project_specifier, "_tumor_counts.csv.gz"))))
+  write.csv(paired_patient_metadata, data_path("paired_metadata.csv"))
+  write.csv(paired_counts_matrix, gzfile(data_path("paired_counts.csv.gz")))
+  write.csv(tumor_patient_metadata, data_path("tumor_metadata.csv"))
+  write.csv(tumor_counts_matrix, gzfile(data_path("tumor_counts.csv.gz")))
 }
 ```
 
-## Session Info
 
-```{r session_info}
-sessionInfo()
-```
