@@ -46,8 +46,8 @@ image_path <- function(name) file.path(image_dir,   paste0(project_specifier, "_
 # ---- Analysis parameters ----------------------------------
 
 # Task 2: DEGs
-padj_thresh <- 0.01   # adjusted p-value (FDR)
-lfc_thresh  <- 2      # |log2 fold change| (2 = fold change 4)
+padj_thresh <- 0.01                 # adjusted p-value (FDR)
+lfc_thresh <- log2(4) #or log2(3)   # |log2 fold change| 
 
 
 # Task 3: co-expression networks
