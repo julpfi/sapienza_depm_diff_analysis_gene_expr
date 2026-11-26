@@ -37,17 +37,24 @@ results_dir <- file.path(root_dir, "results")   # tables (small, in git)
 image_dir <- file.path(root_dir, "images")    # figures for the report
 
 # File names with project prefix, e.g. data_path("vst.rds") -> data/TCGA-PRAD_vst.rds
-data_path <- function(name) file.path(data_dir,    paste0(project_specifier, "_", name))
+data_path <- function(name) file.path(data_dir, paste0(project_specifier, "_", name))
 results_path <- function(name) file.path(results_dir, paste0(project_specifier, "_", name))
-image_path <- function(name) file.path(image_dir,   paste0(project_specifier, "_", name))
+image_path <- function(name) file.path(image_dir, paste0(project_specifier, "_", name))
 
+
+
+
+# ---- Caches -----------------------------------------------------------------
+
+dds_cache <- data_path("dds.rds")   # DESeq2 fit (Task 2), ~15 min to compute
+force_deseq <- FALSE                  # TRUE -> recompute even if a valid cache exists
 
 
 # ---- Analysis parameters ----------------------------------
 
 # Task 2: DEGs
 padj_thresh <- 0.01                 # adjusted p-value (FDR)
-lfc_thresh <- log2(4) #or log2(3)   # |log2 fold change| 
+lfc_thresh <- log2(4)               # |log2 fold change| 
 
 
 # Task 3: co-expression networks
