@@ -1,0 +1,3 @@
+"","nodes","edges","density","mean_degree","median_degree","max_degree","isolated","lcc_fraction","clustering","path_length"
+"cancer",552,5617,0.0369,20.4,10,98,50,0.897,0.583,3.47
+"normal",552,14413,0.0948,52.2,41.5,174,24,0.953,0.508,2.4

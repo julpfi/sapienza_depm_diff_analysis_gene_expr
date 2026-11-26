@@ -1,23 +1,748 @@
 ---
-title: "03 - Co-expression Networks"
-author: "Julius Pfingsten, Simone Massinelli, Francesco Nardiello"
-date: "2026-11-18"
+title: "03 - Gene Co-expression Networks"
+author: "Julius Pfingsten, Simone Massinelli"
+date: "`r Sys.Date()`"
 output: html_document
 ---
 
 ```{r setup, include=FALSE}
-knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  fig.align = "center"
+)
 ```
 
 
+
+# Setup
+
+```{r config}
+source("config.R")
+check_and_load_packages(required_packages)    # Installation done in 01_ 
+set.seed(random_seed)
+```
+
+
+
+# Load Data
+
+- From `01_data_preparation`: sample metadata and gene annotation (`paired_se`)
+- From `02_diff_expr_genes`: VST matrix (all filtered genes x 104 samples) and DEG table
 
 ```{r load_data}
-paired_se <- readRDS(file.path("data", "TCGA-PRAD_paired_se.rds"))
+paired_se <- readRDS(data_path("paired_se.rds"))
+vst_expr <- readRDS(data_path("vst.rds"))
+degs <- read.csv(results_path("degs.csv"))
 
-counts   <- SummarizedExperiment::assay(paired_se, "counts")          # genes x samples
-metadata <- as.data.frame(SummarizedExperiment::colData(paired_se))   # one row per sample
-genes    <- as.data.frame(SummarizedExperiment::rowData(paired_se))   # gene_id, gene_name, gene_type
+sample_metadata <- as.data.frame(colData(paired_se))
+gene_symbol <- setNames(rowData(paired_se)$gene_name, 
+                        rownames(paired_se))
 
-# DESeq2 can use it directly:
-# dds <- DESeq2::DESeqDataSet(paired_se, design = ~ patient + condition)
+
+# Expression matrix and metadata must describe the same samples in the same order
+stopifnot(identical(colnames(vst_expr), rownames(sample_metadata)))
+
+dim(vst_expr)
+table(degs$status)
 ```
+
+
+## Restrict to DEGs and Split by Condition
+
+- Nodes of both networks = DEGs
+- One expression matrix per condition (52 samples each)
+
+```{r split_conditions}
+# Get IDs of DEGs and make sure they are in VST expressions
+deg_ids <- degs$gene_id
+stopifnot(all(deg_ids %in% rownames(vst_expr)))
+
+# Get sample IDs 
+cancer_samples <- rownames(sample_metadata)[sample_metadata$condition == "cancer"]
+normal_samples <- rownames(sample_metadata)[sample_metadata$condition == "normal"]
+
+# Extract DEGs from VST expressions and split by condition 
+expr_cancer <- vst_expr[deg_ids, cancer_samples]
+expr_normal <- vst_expr[deg_ids, normal_samples]
+
+
+cat("DEGs (nodes):", length(deg_ids),"| cancer samples:", ncol(expr_cancer),"| normal samples:", ncol(expr_normal), "\n")
+```
+
+
+# Network Helper Functions
+
+```{r network_helper_functions}
+# Binary adjacency: a_ij = 1 if |rho_ij| >= threshold, no self-loops
+build_adjacency <- function(cor_matrix, threshold) {
+  adj <- (abs(cor_matrix) >= threshold) * 1
+  diag(adj) <- 0
+  adj
+}
+
+# Undirected, unweighted network
+build_network <- function(cor_matrix, threshold) {
+  graph_from_adjacency_matrix(build_adjacency(cor_matrix, threshold), mode = "undirected")
+}
+
+# Basic network metrics
+network_summary <- function(g) {
+  k <- degree(g)
+  data.frame(
+    edges = ecount(g),
+    density = round(edge_density(g), 4),
+    mean_degree = round(mean(k), 2),
+    isolated = sum(k == 0),                           # counts isolated nodes
+    components = sum(components(g)$csize > 1),        # ignores isolated nodes
+    lcc_fraction = round(max(components(g)$csize) / vcount(g), 4)
+  )
+}
+
+# Upper triangle of a symmetric matrix (each gene pair once)
+upper_values <- function(m) m[upper.tri(m)]
+
+
+# Jaccard index of two sets/logical vectors
+jaccard <- function(a, b) {
+  if (is.logical(a)) {
+    sum(a & b) / sum(a | b)
+  } else {
+    length(intersect(a, b)) / length(union(a, b))
+  }
+}
+
+# Construct degree distribution 
+degree_distribution <- function(g, condition) {
+  k  <- degree(g)
+  degree_distro <- as.data.frame(table(k[k > 0]))  # Nodes with k = 0 are excluded as log(0) = -Inf
+  colnames(degree_distro) <- c("k", "count")
+  
+  degree_distro$k <- as.numeric(as.character(degree_distro$k))
+  degree_distro$p <- degree_distro$count / vcount(g)       # P(k) = N(k) / N
+  degree_distro$condition <- condition
+  degree_distro
+}
+
+# Find Hubs -> nodes with degree >= (1 - fraction) quantile among connected nodes
+find_hubs <- function(g, fraction = hub_fraction) {
+  k <- degree(g)
+  cutoff <- quantile(k[k > 0], 1 - fraction)
+  sort(k[k >= cutoff], decreasing = TRUE)   # ties kept
+}
+
+```
+
+
+
+# Co-expression Measure
+
+- Correlation between each pair of DEGs, computed across the samples of one condition
+- Co-expression across VST values -> normalized and variance-stabilized (roughly symmetric) 
+- Both Pearson and Spearman are computed to choose the measure
+
+```{r correlations}
+# cor() correlates columns -> transpose to genes in columns
+cor_all <- list(
+  pearson  = list(cancer = cor(t(expr_cancer), method = "pearson"),
+                  normal = cor(t(expr_normal), method = "pearson")),
+  spearman = list(cancer = cor(t(expr_cancer), method = "spearman"),
+                  normal = cor(t(expr_normal), method = "spearman"))
+)
+```
+
+
+## Pearson vs Spearman
+
+- Pearson captures a linear relationship (sensitive to outliers) 
+- Spearman is the Pearson correlation on ranks. Thus, it captures any monotonic relationship (more robust to outliers) 
+
+
+- Comparison of both for a DEG pair:
+  - |Pearson| $\approx$ |Spearman| -> mostly linear relationship (=> Pearson is sufficient)
+  - |Pearson| << |Spearman| -> monotonic but non-linear relationship
+  - |Pearson| >> |Spearman| -> correlation driven by a few extreme samples
+  
+
+
+```{r method_comparison}
+compare_methods <- function(cor_pearson, cor_spearman, threshold) {
+  # Vector of correlation values from cor matrix
+  p <- upper_values(cor_pearson)
+  s <- upper_values(cor_spearman)
+  
+  # Get hubs from the resulting networks 
+  hubs_p <- names(find_hubs(build_network(cor_pearson, threshold)))
+  hubs_s <- names(find_hubs(build_network(cor_spearman, threshold)))
+  
+  # 3 views for comparison 
+  data.frame(
+    # 1) Correlation values
+    pearson_spearman_cor = round(cor(p, s), 3),               # Correlation of Pearson vs Spearman
+    mean_abs_diff = round(mean(abs(p - s)), 3),               # Mean difference 
+
+    # 2) Edges of resulting networks 
+    edges_pearson = sum(abs(p) >= threshold),                   #  # of edges using pearson
+    edges_spearman = sum(abs(s) >= threshold),                  #  # of edges using spearman
+    edge_jaccard = round(jaccard(abs(p) >= threshold           #  IoU of edges 
+                                 , abs(s) >= threshold), 3),
+    
+    # 3) Hubs of resulting networks: IoU  
+    hub_jaccard = round(jaccard(hubs_p, hubs_s), 3)
+  )
+}
+
+# Compare splited by condition 
+rbind(
+  cancer = compare_methods(cor_all$pearson$cancer, cor_all$spearman$cancer, cor_threshold),
+  normal = compare_methods(cor_all$pearson$normal, cor_all$spearman$normal, cor_threshold)
+)
+```
+
+Overall, the Pearson and Spearman correlations agree strongly across all DEG pairs. For each DEG pair, both measures give a correlation value between −1 and 1. We quantify the agreement between both the two correlation types by the Pearson correlation between the two sets of values, which measures how closely the points follow their least-squares fit. It is high in both conditions (0.947 in cancer and 0.934 in normal tissue). In addition, the mean absolute difference between the Pearson and Spearman value of a pair is small (0.053 and 0.095).
+
+However, the choice of co-expression measure matters for the resulting networks, where edges are determined by strong co-expression ($|\rho| \ge 0.5$). Here, the two measures give different results. 
+In cancer, Pearson yields about 10% more edges than Spearman (6,178 vs 5,617) and the two networks share 64% of their edges quantified by their Jaccard index. 
+In normal tissue, the difference is much larger. Pearson yields 72% more edges (24,803 vs 14,413) and the edge overlap drops to 44%.
+
+The resulting hubs also differ between the two measures, with a hub overlap of 75% in cancer. In normal tissue, the difference is much larger, with an overlap of only 37%.
+
+```{r DEG_pair_largest_pearson_spearman_diff}
+# Gene pair where Pearson and Spearman differ most (signed values: direction counts too)
+max_gap_pair <- function(condition) {
+  gap  <- abs(cor_all$pearson[[condition]] - cor_all$spearman[[condition]])
+  pair <- arrayInd(which.max(gap), dim(gap))   # (row, column) of the maximum
+  rownames(gap)[pair[1, ]]                     # row and column names are the same genes
+}
+
+max_gap <- list(cancer = max_gap_pair("cancer"), normal = max_gap_pair("normal"))
+
+# Scatter plot of one gene pair: each point = one sample
+plot_gene_pair <- function(condition) {
+  genes <- max_gap[[condition]]
+  expr  <- if (condition == "cancer") expr_cancer else expr_normal
+
+  ggplot(data.frame(x = expr[genes[1], ], y = expr[genes[2], ]), aes(x = x, y = y)) +
+    geom_point(colour = color_palette[["primary"]]) +
+    geom_smooth(method = "lm", formula = y ~ x, se = FALSE,
+                colour = color_palette[["secondary"]], linetype = "dashed") +
+    labs(x = paste("Gene:", gene_symbol[genes[1]], "(VST)"),
+         y = paste("Gene:", gene_symbol[genes[2]], "(VST)"),
+         title = paste("Largest Pearson-Spearman difference:", condition),
+         subtitle = sprintf("Pearson = %.2f, Spearman = %.2f",
+                            cor_all$pearson[[condition]][genes[1], genes[2]],
+                            cor_all$spearman[[condition]][genes[1], genes[2]]))
+}
+
+for (condition in names(max_gap)) {
+  p <- plot_gene_pair(condition)
+  print(p)
+  save_plot(p, paste0("task3_max_gap_pair_", condition), width = 5, height = 4)
+}
+```
+
+
+We illustrate the difference between the two correlation types as co-expression measures by plotting, for each condition, the DEG pair with the largest difference between Pearson and Spearman correlation. Each point is one sample of the condition. The dashed line is the least-squares fit, that is the linear relationship that Pearson correlation measures.
+
+For cancer tissue, the DEG pair is PPP1R3A and LRTM1. The Pearson correlation is strongly positive (0.85), while the Spearman correlation is only weakly positive (0.16). At the thresholds tested later, the pair would therefore be linked when using Pearson, but not when using Spearman. Most samples lie at the lower end of the VST scale ($\approx$ 3.1, i.e. zero or near-zero counts), where the two genes show no clear relationship. The strong Pearson correlation is driven by two samples with high expression of both genes, which dominate the linear fit.
+
+For normal tissue, the DEG pair is AC069228.1 and AL021395.1. The Pearson correlation is strongly positive (0.70), while the Spearman correlation is close to zero (−0.05). Again, most samples cluster at low expression values without a consistent relationship, and the Pearson correlation is driven mainly by a single sample with very high expression of both genes. In both conditions, a few extreme samples create a strong Pearson correlation that the ranks of the remaining samples do not support.
+
+
+```{r edge_link_coexpression_measure}
+method_pairs <- bind_rows(lapply(c("cancer", "normal"), function(condition) {
+  data.frame(condition = condition,
+             pearson = upper_values(cor_all$pearson[[condition]]),
+             spearman = upper_values(cor_all$spearman[[condition]]))
+}))
+
+method_pairs$edge <- case_when(
+  abs(method_pairs$pearson) >= cor_threshold & abs(method_pairs$spearman) >= cor_threshold ~ "both",
+  abs(method_pairs$pearson)  >= cor_threshold ~ "Pearson only",
+  abs(method_pairs$spearman) >= cor_threshold ~ "Spearman only",
+  TRUE ~ "no edge"  # default case = neither would link DEG pair 
+)
+
+
+# All edge pairs + a random subset of non-edges as background (plotting speed)
+no_edge    <- which(method_pairs$edge == "no edge")
+plot_pairs <- method_pairs[c(sample(no_edge, min(20000, length(no_edge))),
+                             which(method_pairs$edge != "no edge")), ]
+
+
+
+# Position of the max-gap pairs from previous plot 
+gap_points <- bind_rows(lapply(names(max_gap), function(condition) {
+  genes <- max_gap[[condition]]
+  data.frame(condition = condition,
+             pearson = cor_all$pearson[[condition]][genes[1], genes[2]],
+             spearman = cor_all$spearman[[condition]][genes[1], genes[2]],
+             label = paste(gene_symbol[genes[1]], "-", gene_symbol[genes[2]]))
+}))
+
+
+p_edges <- ggplot(plot_pairs, aes(x = pearson, y = spearman, colour = edge)) +
+  geom_point(alpha = 0.4, size = 0.6) +
+  geom_vline(xintercept = c(-cor_threshold, cor_threshold), linetype = "dotted") +
+  geom_hline(yintercept = c(-cor_threshold, cor_threshold), linetype = "dotted") +
+  geom_point(data = gap_points, colour = "black", shape = 21, size = 3, stroke = 1) +
+  geom_text(data = gap_points, aes(label = label), colour = "black", vjust = -1.2, size = 3) +
+  scale_colour_manual(values = edge_colors) +
+  guides(colour = guide_legend(override.aes = list(size = 3, alpha = 1))) +
+  facet_wrap(~ condition) +
+  labs(x = "Pearson correlation", y = "Spearman correlation", 
+       colour =  paste0("Edge at |rho| >= ", cor_threshold),
+       title = "Edges retained by Pearson and Spearman")
+
+p_edges
+save_plot(p_edges, "task3_edge_retention", width = 9, height = 4.5)
+
+
+
+
+# Share of DEGs with at least one sample more than 4 SD from the gene's mean
+extreme_share <- function(expr, z_cutoff) {
+  z <- (expr - rowMeans(expr)) / apply(expr, 1, sd)            # z-score per gene = (value - gene mean) / gene SD
+  max_abs_z <- apply(abs(z), 1, max)                           # most extreme sample of each gene
+  mean(max_abs_z > z_cutoff)                                   # share of genes with an extreme sample
+}
+
+
+z_cutoff <- 4
+
+c(cancer = extreme_share(expr_cancer, z_cutoff), 
+  normal = extreme_share(expr_normal, z_cutoff),
+  expected = 1 - (1 - 2*pnorm(z_cutoff, lower.tail = FALSE))^ncol(expr_cancer))
+# Also tested 3SD +/- 
+```
+
+The plot shows the edges retained by Pearson and Spearman correlation as a co-expression measure. Each point is a DEG pair, positioned by its Pearson (x) and Spearman (y) correlation. The dotted lines mark the threshold of 0.5 that is discussed later. Blue pairs are edges with both measures, orange pairs only with Pearson, green pairs only with Spearman.
+
+In cancer, most edges are shared, with a moderate number of Pearson-only edges at positive correlations. In normal tissue, Pearson additionally retains many edges at both positive and negative correlations. Spearman-only edges are rare in both conditions.
+
+Pearson-only edges are DEG pairs whose strong Pearson correlation is not reflected in the ranks of the samples. This suggests that the correlation is driven by a few samples with extreme values rather than by a consistent relationship across all samples. 
+Extreme samples are indeed common among the DEGs. 9% of DEGs in cancer and 14% in normal tissue have at least one sample more than 4 standard deviations from the gene's mean, compared with about 0.3% expected for normally distributed values. The higher share in normal tissue is consistent with the larger number of Pearson-only edges there.
+
+Circled are the pairs with the largest Pearson–Spearman difference shown in the previous figure (PPP1R3A–LRTM1 in cancer, AC069228.1–AL021395.1 in normal tissue).
+
+
+
+## Evaluate Mutual Information
+```{r evaluate_mi}
+# Observed vs null (randomly permutation) for different numbers of bins 
+
+expr_null <- apply(expr_cancer, 1, sample)   # samples x genes (genes shuffled independently)
+
+mi_vs_null <- function(nbins) { 
+  # expects samples in rows, genes in columns -> t()
+  mi_obs  <- upper_values(minet::build.mim(t(expr_cancer), estimator = "mi.empirical",
+                                           disc = "equalfreq", nbins = nbins))
+  mi_null <- upper_values(minet::build.mim(expr_null, estimator = "mi.empirical",
+                                           disc = "equalfreq", nbins = nbins))
+  data.frame(
+    nbins = nbins,
+    median_observed = round(median(mi_obs), 3),
+    median_null = round(median(mi_null), 3),
+    share_above_null = round(mean(mi_obs > quantile(mi_null, 0.99)), 3)   # 0.01 expected by chance
+  )
+}
+
+bind_rows(lapply(c(3, 5, 7), mi_vs_null))
+```
+
+Mutual information (MI) was evaluated as an alternative co-expression measure. MI was estimated with equal-frequency discretization using 3, 5 and 7 bins. 
+To estimate the noise, we built a null model by shuffling each gene's values independently across the cancer samples. This removes all gene–gene dependencies, so any remaining MI reflects estimation bias only. 
+For all bin settings, the median MI of the null nearly matched the observed median (0.032 vs 0.044, 0.166 vs 0.182, 0.390 vs 0.407). The bias grew with the number of bins. The signal, that is the MI beyond the null, was therefore small. Only 3.4-6.1% of gene pairs exceeded the 99th percentile of the null, compared with 1% expected by chance. 
+With 52 samples per condition, MI estimates were dominated by bias, and MI was therefore not used.
+
+
+
+## Select Co-expression Measure
+
+```{r selected_correlation}
+cor_cancer <- cor_all[[cor_method]]$cancer
+cor_normal <- cor_all[[cor_method]]$normal
+
+summary(upper_values(cor_cancer))
+summary(upper_values(cor_normal))
+```
+
+
+Pearson and Spearman agree for most DEG pairs, but in the strong correlations that determine
+the edges, the Pearson correlation is affected by a few samples with extreme values, especially in normal
+tissue. Mutual information is dominated by estimation bias with 52 samples per condition.
+We therefore use Spearman correlation as the co-expression measure in the further analysis. 
+
+
+
+# Network Construction
+
+Binary (hard-threshold) adjacency matrix:
+- $a_{ij} = 1$ if $|\rho_{ij}| \ge \tau$, otherwise $a_{ij} = 0$; $a_{ii} = 0$
+- Undirected, unweighted
+
+- Nodes = DEGs
+- Edges = strong positive or negative co-expression defined by co-expression measure
+
+
+## Threshold Selection
+
+The hard threshold $\tau$ for linking two DEGs strongly affects the resulting network. The goal is a network that is sparse but has a large connected component. We compare different values around the suggested $\tau = 0.7$ and evaluate how the characteristics of the networks change in both conditions.
+
+```{r threshold_check}
+thresholds <- c(0.4, 0.5, 0.55, 0.6, 0.7, 0.8, 0.9)
+
+threshold_check <- bind_rows(lapply(thresholds, function(tau) {
+  rbind(
+    cbind(condition = "cancer", threshold = tau, network_summary(build_network(cor_cancer, tau))),
+    cbind(condition = "normal", threshold = tau, network_summary(build_network(cor_normal, tau)))
+  )
+}))
+
+threshold_check
+```
+
+
+At $\tau = 0.7$, the cancer network was fragmented with 60% of the genes isolated, and the largest connected component contained only 18% of the nodes. Lower thresholds increased connectivity, while $\tau = 0.4$ produced overly dense networks (density up to 20%). We therefore chose $\tau = 0.5$, the largest threshold at which the largest connected component contained at least 90% of the nodes in both conditions (90% cancer, 95% normal) and with densities of 3.7% and 9.5%.
+
+
+
+Main parameters set: 
+
+```{r parameters}
+cat("Co-expression measure:", cor_method, "| threshold |rho| >=", cor_threshold, "| hub fraction:", hub_fraction, "\n")
+```
+
+
+```{r build_networks}
+g_cancer <- build_network(cor_cancer, cor_threshold)
+g_normal <- build_network(cor_normal, cor_threshold)
+```
+
+
+
+# Network Analysis
+
+## Network Overview
+
+Basic characteristics of the two co-expression networks (nodes = DEGs, Spearman, $|\rho| \ge 0.5$).
+
+```{r network_overview}
+degree_cancer <- degree(g_cancer)
+degree_normal <- degree(g_normal)
+
+network_overview <- function(g) {
+  k <- degree(g)
+  data.frame(
+    nodes = vcount(g),
+    edges = ecount(g),
+    density = round(edge_density(g), 4),
+    mean_degree = round(mean(k), 1),
+    median_degree = median(k),
+    max_degree = max(k),
+    isolated = sum(k == 0),
+    lcc_fraction = round(max(components(g)$csize) / vcount(g), 3),
+    clustering = round(transitivity(g, type = "global"), 3),
+    path_length = round(mean_distance(g), 2)      # connected pairs only
+  )
+}
+
+
+t(rbind(cancer = network_overview(g_cancer), 
+        normal = network_overview(g_normal)))
+```
+
+Both networks contain the same 552 DEGs as nodes, but the normal network has about 2.6 times as many edges as the cancer network (14,413 vs 5,617). Accordingly, the mean degree is higher in normal tissue (52.2 vs 20.4), and fewer genes are isolated (24 vs 50). Thus, more gene pairs are strongly co-expressed in normal tissue than in cancer. 
+
+Both networks are largely connected (90% of the genes in the largest component in cancer, 95% in normal tissue) and show a relatively high clustering coefficient (0.58 and 0.51), which is compared against a random null model below. 
+
+
+
+## Degree Distribution and Scale-free Check
+
+- Degree $k_i = \sum_j a_{ij}$ = number of co-expressed partners of gene $i$
+- Degree distribution $P(k) = N(k) / N$
+- Scale-free network: power-law degree distribution $P(k) \propto k^{-\gamma}$
+  - Straight line in a log-log plot: $\log P(k) = -\gamma \log k + \log c$
+  - Real scale-free networks typically have $2 < \gamma < 3$
+- Two checks:
+  - Linear fit in log-log space (slope = $-\gamma$, $R^2$ = how linear)
+  - `fit_power_law()`: maximum-likelihood fit with Kolmogorov-Smirnov test; p-value > 0.05 -> power law not rejected
+
+```{r scale_free_check}
+check_scale_free <- function(g) {
+  k  <- degree(g)
+  dd <- degree_distribution(g, "")
+
+  loglog_fit <- lm(log10(p) ~ log10(k), data = dd)                                  # 1) log-log fit
+  powerlaw   <- fit_power_law(k[k > 0], implementation = "plfit", p.value = TRUE)   # 2) MLE + KS test
+
+  data.frame(
+    # 1) 
+    gamma_loglog = round(-unname(coef(loglog_fit)[2]), 2),
+    r2_loglog = round(summary(loglog_fit)$r.squared, 4),
+    # 2)
+    gamma_mle = round(powerlaw$alpha, 2),
+    k_min = powerlaw$xmin,
+    ks_p_value = round(powerlaw$KS.p, 4)
+  )
+}
+
+rbind(cancer = check_scale_free(g_cancer), 
+      normal = check_scale_free(g_normal))
+```
+
+Neither network is scale-free. 
+
+The log-log degree distributions deviated from a straight line ($R^2$ = 0.75 in cancer and 0.48 in normal tissue, with slopes of −0.85 and −0.50). The maximum-likelihood power-law fits (cancer: $\gamma$ = 4.36 for $k \ge 46$; normal: $\gamma$ = 4.83 for $k \ge 92$) were also rejected (KS p-value < 0.001 in both conditions).
+
+
+
+```{r degree_distribution_plot, fig.width=8, fig.height=4}
+degree_dist <- bind_rows(degree_distribution(g_cancer, "cancer"),
+                         degree_distribution(g_normal, "normal"))
+
+p_degree <- ggplot(degree_dist, aes(x = k, y = p)) +
+  geom_point(aes(colour = condition), alpha = 0.7) +
+  geom_smooth(method = "lm", formula = y ~ x, se = FALSE, colour = "black", linewidth = 0.6) +
+  scale_colour_manual(values = condition_colors, guide = "none") +
+  scale_x_log10() +
+  scale_y_log10() +
+  facet_wrap(~ condition) +
+  labs(x = "Degree k (log scale)", y = "P(k) (log scale)",
+       title = paste0("Degree distribution (", cor_method, ", |rho| >= ", cor_threshold, ")"))
+
+p_degree
+save_plot(p_degree, "task3_degree_distribution", width = 8, height = 4)
+```
+
+The plot shows the degree distribution $P(k)$ of both networks on a log-log scale with a fitted straight line. For a scale-free network, the points would lie on this line.
+
+In cancer, the points roughly follow the line for low degrees ($k \le 10$), but scatter around it for higher degrees. In normal tissue, the distribution is considerably flatter. Only a few genes have a low degree, and many genes have degrees between 10 and about 170, so the points barely follow the line. 
+In both networks, most high degree values are reached by only one or two genes, which forms the horizontal rows of points at the bottom of the plot. Instead of a few extremely connected hubs, both networks contain many genes with moderately high degree. 
+The plot thus supports the conclusion that neither network is scale-free.
+
+
+## Comparison with a Random Network
+
+- Random network (Erdős–Rényi, $G(n, m)$) with the same number of nodes and edges -> edges placed at random
+- Compares the structure of the co-expression networks with chance:
+  - Clustering coefficient -> Are the neighbours of a gene also connected with each other?
+  - Average path length -> How many steps separate two genes on average?
+  - Maximum degree -> Are there genes far more connected than chance would produce?
+  
+- Small-world property: clustering much higher than in a random network, while the path length is similar to random
+
+```{r random_comparison}
+# Network statistics of one network
+network_stats <- function(g) {
+  c(clustering = transitivity(g, type = "global"),
+    path_length = mean_distance(g),        # connected pairs only
+    max_degree = max(degree(g)))
+}
+
+
+random_comparison <- function(g, n_random = 10) {
+  observed <- network_stats(g)
+  
+  # Generate {n_random} random networks 
+  random_networks <- replicate(n_random, network_stats(sample_gnm(vcount(g), ecount(g))))
+  # All random networks are averaged into one 
+  random <- rowMeans(random_networks)
+
+  data.frame(
+    clustering = round(observed[["clustering"]], 3),
+    clustering_random = round(random[["clustering"]], 3),
+    
+    path_length = round(observed[["path_length"]], 2),
+    path_length_random = round(random[["path_length"]], 2),
+    
+    max_degree = observed[["max_degree"]],
+    max_degree_random = round(random[["max_degree"]], 1)
+  )
+}
+
+rbind(cancer = random_comparison(g_cancer), normal = random_comparison(g_normal))
+```
+
+Compared with random networks of the same size and density, both networks show a much higher clustering coefficient (cancer: 0.58 vs 0.04; normal: 0.51 vs 0.10). The average path length is only slightly longer than in a random network and still short (3.47 vs 2.42; 2.40 vs 1.91). 
+
+Both networks are therefore small-world networks with a strong modular structure, meaning that genes form groups of mutually co-expressed genes. The most connected genes have about 2–3 times the maximum degree expected by chance (98 vs 35; 174 vs 75), which justifies analysing them as highly connected genes despite the lack of a scale-free topology.
+
+
+
+# Hubs
+
+- Hubs = 5% of nodes with highest degree
+- Cutoff = 95th percentile of the degree among connected nodes ($k > 0$)
+- Tied genes at the cutoff are kept
+
+Hubs in the strict sense require a scale-free network. As this is not the case here, we analyse them as highly connected genes, which the comparison with random networks supports.
+
+```{r hubs}
+hubs_cancer <- find_hubs(g_cancer)
+hubs_normal <- find_hubs(g_normal)
+
+cat("Hubs cancer:", length(hubs_cancer), "| hubs normal:", length(hubs_normal), "\n")
+```
+
+
+## Hub Cutoff
+
+```{r hub_cutoff, fig.width=7, fig.height=4}
+# Degrees of connected genes (k > 0, as for the hub cutoff)
+degree_values <- rbind(
+  data.frame(condition = "cancer", degree = degree_cancer[degree_cancer > 0]),
+  data.frame(condition = "normal", degree = degree_normal[degree_normal > 0])
+)
+
+# Effective hub cutoff = lowest degree among the hubs of each condition
+hub_cutoffs <- data.frame(
+  condition = c("cancer", "normal"),
+  cutoff = c(min(hubs_cancer), min(hubs_normal)),
+  median_degree = c(median(degree_cancer[degree_cancer > 0]),
+                    median(degree_normal[degree_normal > 0]))
+)
+hub_cutoffs
+
+
+p_degree_ecdf <- ggplot(degree_values, aes(x = degree, colour = condition)) +
+  stat_ecdf(geom = "step") +
+  geom_hline(yintercept = 1 - hub_fraction, linetype = "dotted", colour = "grey40") +
+  geom_vline(data = hub_cutoffs, aes(xintercept = cutoff, colour = condition),
+             linetype = "dashed") +
+  scale_colour_manual(values = condition_colors) +
+  labs(x = "Degree k", y = "Share of genes with degree <= k", colour = NULL,
+       title = "Cumulative degree distribution and hub cutoff (top 5%)")
+
+p_degree_ecdf
+save_plot(p_degree_ecdf, "task3_degree_ecdf", width = 7, height = 4)
+```
+
+The plot shows, for each degree $k$, the share of genes with at most this degree. The dashed lines mark the hub cutoff (top 5%) of each network. 
+The cancer ECDF rises more steeply. Half of the genes have a degree of about 12 or less and the hub cutoff lies at about 72. In normal tissue, the ECDF curve rises much more gradually (median degree about 45), and the cutoff lies at about 140. As the normal network is denser, a gene needs about twice as many connections to count as a hub there.
+
+
+
+## Compare Hub Sets
+
+- Common hubs: hubs in both conditions
+- Selective hubs: hubs in only one condition
+
+```{r compare_hubs}
+common_hubs      <- intersect(names(hubs_cancer), names(hubs_normal))
+cancer_only_hubs <- setdiff(names(hubs_cancer), names(hubs_normal))
+normal_only_hubs <- setdiff(names(hubs_normal), names(hubs_cancer))
+
+cat("Common:", length(common_hubs),
+    "| cancer only:", length(cancer_only_hubs),
+    "| normal only:", length(normal_only_hubs), "\n")
+
+hub_table <- data.frame(gene_id = union(names(hubs_cancer), names(hubs_normal))) %>%
+  mutate(
+    gene_name     = gene_symbol[gene_id],
+    hub_type      = case_when(gene_id %in% common_hubs      ~ "common",
+                              gene_id %in% cancer_only_hubs ~ "cancer only",
+                              gene_id %in% normal_only_hubs ~ "normal only"),
+    degree_cancer = degree_cancer[gene_id],
+    degree_normal = degree_normal[gene_id]
+  ) %>%
+  left_join(degs %>% select(gene_id, log2FoldChange, padj, status), by = "gene_id") %>%
+  arrange(hub_type, desc(degree_cancer))
+
+hub_table
+
+# Regulation direction of the hubs
+table(hub_table$hub_type, hub_table$status)
+```
+
+The two networks share no hubs. All 27 cancer hubs and all 28 normal hubs are selective for their condition. 
+All cancer-only hubs are down-regulated in cancer, while the normal-only hubs are mostly up-regulated (19/28). 
+
+
+## Degree Change Between Conditions
+
+- Simple comparison of the two networks: degree of each gene in both conditions
+- Note: the normal network is denser, so most genes lie below the diagonal
+
+```{r degree_comparison_plot, fig.width=5, fig.height=5}
+degree_comparison <- data.frame(
+  gene_id = deg_ids,
+  gene_name = gene_symbol[deg_ids],
+  degree_cancer = degree_cancer[deg_ids],
+  degree_normal = degree_normal[deg_ids]
+) %>%
+  mutate(hub_type = case_when(gene_id %in% common_hubs ~ "common hub",
+                              gene_id %in% cancer_only_hubs ~ "cancer-only hub",
+                              gene_id %in% normal_only_hubs ~ "normal-only hub",
+                              TRUE ~ "no hub"))
+
+p_degree_comparison <- ggplot(degree_comparison,
+                              aes(x = degree_normal, y = degree_cancer, colour = hub_type)) +
+  geom_abline(linetype = "dashed", colour = "grey") +
+  geom_point(alpha = 0.6) +
+  scale_colour_manual(values = hub_colors) +
+  labs(x = "Degree in normal network", y = "Degree in cancer network", colour = NULL)
+
+p_degree_comparison
+save_plot(p_degree_comparison, "task3_degree_comparison", width = 5, height = 5)
+
+
+
+
+
+# Degree range "min-max" of a set of genes
+degree_range <- function(degrees) paste(range(degrees), collapse = "-")
+
+hub_degree_ranges <- data.frame(
+  degree_cancer = c(degree_range(degree_cancer[cancer_only_hubs]),
+                    degree_range(degree_cancer[normal_only_hubs])),
+  degree_normal = c(degree_range(degree_normal[cancer_only_hubs]),
+                    degree_range(degree_normal[normal_only_hubs])),
+  row.names = c("cancer-only hubs", "normal-only hubs")
+)
+
+hub_degree_ranges
+```
+
+
+Each point is a DEG mapped by its degree in the normal and cancer network. 
+Cancer-only hubs (degree 72–98 in cancer) cover a wide range of degrees in normal tissue, from isolated genes up to 137 connections, just below the normal hub cutoff of 140. 
+Normal-only hubs (degree 140–174 in normal) mostly have few connections in cancer (degree 0–53).
+
+Overall, a gene's degree in one network says little about its degree in the other. The co-expression structure is rearranged between the conditions rather than generally denser or sparser.
+
+# TODO LITERATURE BACKGROUND ON CANCER HUBS/HIGHLY CONNECTED GENES
+
+
+
+# TODO Centrality (OPTIONAL TASK)
+
+
+# Save Results
+
+
+```{r save_results}
+# Tables -> results/ 
+network_overview_table <- rbind(cancer = network_overview(g_cancer),
+                                normal = network_overview(g_normal))
+
+write.csv(network_overview_table, results_path("task3_network_overview.csv"))
+write.csv(threshold_check, results_path("task3_threshold_check.csv"), row.names = FALSE)
+write.csv(hub_table, results_path("task3_hubs.csv"), row.names = FALSE)
+write.csv(degree_comparison, results_path("task3_degrees.csv"), row.names = FALSE)
+
+# Networks, correlations and hubs -> data/
+saveRDS(list(g_cancer = g_cancer,
+             g_normal = g_normal,
+             cor_cancer = cor_cancer,          # selected measure (cor_method)
+             cor_normal = cor_normal,
+             hubs_cancer = hubs_cancer,
+             hubs_normal = hubs_normal,
+             cor_method = cor_method,
+             cor_threshold = cor_threshold),
+        data_path("task3_networks.rds"))
+
+```
+
